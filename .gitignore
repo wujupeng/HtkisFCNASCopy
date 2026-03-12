@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+dmg_stage/
+*.app/
+*.dmg
+*.iconset/
+*.icns
+__pycache__/
+*.pyc
+resume-smb-copy
+resume-smb-download
+pc.rar
