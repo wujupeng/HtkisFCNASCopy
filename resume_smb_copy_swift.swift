@@ -1,6 +1,31 @@
 import CryptoKit
+import Dispatch
 import Darwin
 import Foundation
+
+let htkisFCNASCopyVersion = "1.0.5"
+
+final class SignalCancellationState {
+    private let queue = DispatchQueue(label: "HtkisFCNASCopy.SignalCancellation")
+    private var cancelled = false
+    private var sources: [DispatchSourceSignal] = []
+
+    func install() {
+        for sig in [SIGINT, SIGTERM] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+            source.setEventHandler { [weak self] in
+                self?.cancelled = true
+            }
+            source.resume()
+            sources.append(source)
+        }
+    }
+
+    func isCancelled() -> Bool {
+        queue.sync { cancelled }
+    }
+}
 
 enum CopyError: Error, LocalizedError {
     case usage
@@ -8,6 +33,7 @@ enum CopyError: Error, LocalizedError {
     case destinationExists(String)
     case sourceChanged
     case partialLargerThanSource
+    case cancelled
     case incompleteTransfer(got: UInt64, expected: UInt64)
     case verificationFailed
     case smbNotMounted(expectedMountPoint: String)
@@ -27,6 +53,8 @@ enum CopyError: Error, LocalizedError {
             return "Source file changed since last attempt. Use --force to resume anyway."
         case .partialLargerThanSource:
             return "Partial file larger than source. Use --force to overwrite partial."
+        case .cancelled:
+            return "Transfer cancelled. Run again to resume."
         case let .incompleteTransfer(got, expected):
             return "Incomplete transfer: got \(got), expected \(expected)"
         case .verificationFailed:
@@ -70,6 +98,7 @@ func printUsage() {
       --verify            Verify sha256 after transfer (slower)
       --quiet             Reduce output
       --mount-timeout N   Wait up to N seconds for Finder mount (default: 60)
+      --version           Print version
     """
     print(s)
 }
@@ -192,8 +221,21 @@ func findMountedShareDirectory(caseInsensitive share: String) -> URL? {
     return nil
 }
 
-func resolveSMBMountedPath(from smbURLString: String) throws -> URL {
-    guard let u = URL(string: smbURLString), u.scheme?.lowercased() == "smb" else {
+struct SMBURLComponents {
+    var host: String
+    var pathComponents: [String]
+    var shareName: String
+    var remainder: [String]
+}
+
+struct SMBMountEntry {
+    var host: String
+    var remotePathComponents: [String]
+    var mountPoint: URL
+}
+
+func parseSMBURL(_ smbURLString: String) throws -> SMBURLComponents {
+    guard let u = URL(string: smbURLString), u.scheme?.lowercased() == "smb", let host = u.host else {
         throw CopyError.smbURLInvalid(smbURLString)
     }
     let path = u.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -201,20 +243,107 @@ func resolveSMBMountedPath(from smbURLString: String) throws -> URL {
     guard let share = parts.first, !share.isEmpty else {
         throw CopyError.smbURLInvalid(smbURLString)
     }
-    let remainder = parts.dropFirst()
-    var mountBase = URL(fileURLWithPath: "/Volumes").appendingPathComponent(share, isDirectory: true)
+    return SMBURLComponents(
+        host: host,
+        pathComponents: parts,
+        shareName: share,
+        remainder: Array(parts.dropFirst())
+    )
+}
+
+func parseSMBMountEntries(from mountOutput: String) -> [SMBMountEntry] {
+    mountOutput
+        .split(whereSeparator: \.isNewline)
+        .compactMap { line in
+            let s = String(line)
+            guard s.hasPrefix("//"), s.contains("(smbfs") else { return nil }
+            guard let onRange = s.range(of: " on "), let optionsRange = s.range(of: " (", range: onRange.upperBound..<s.endIndex) else {
+                return nil
+            }
+
+            let remoteSpec = String(s[s.index(s.startIndex, offsetBy: 2)..<onRange.lowerBound])
+            let mountPath = String(s[onRange.upperBound..<optionsRange.lowerBound])
+            let remoteParts = remoteSpec.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+            guard remoteParts.count == 2 else { return nil }
+
+            let hostWithUser = String(remoteParts[0])
+            let host = hostWithUser.split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false).last.map(String.init) ?? hostWithUser
+            let pathComponents = String(remoteParts[1]).split(separator: "/").map(String.init)
+            guard !pathComponents.isEmpty else { return nil }
+
+            return SMBMountEntry(
+                host: host,
+                remotePathComponents: pathComponents,
+                mountPoint: URL(fileURLWithPath: mountPath, isDirectory: true)
+            )
+        }
+}
+
+func currentSMBMountEntries() -> [SMBMountEntry] {
+    let p = Process()
+    let pipe = Pipe()
+    p.executableURL = URL(fileURLWithPath: "/sbin/mount")
+    p.standardOutput = pipe
+    p.standardError = Pipe()
+
+    do {
+        try p.run()
+        p.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard p.terminationStatus == 0, let output = String(data: data, encoding: .utf8) else {
+            return []
+        }
+        return parseSMBMountEntries(from: output)
+    } catch {
+        return []
+    }
+}
+
+func hasPrefix(_ pathComponents: [String], prefix: [String]) -> Bool {
+    guard prefix.count <= pathComponents.count else { return false }
+    for (lhs, rhs) in zip(pathComponents, prefix) {
+        if lhs.lowercased() != rhs.lowercased() {
+            return false
+        }
+    }
+    return true
+}
+
+func mountedPath(for components: SMBURLComponents, mountEntries: [SMBMountEntry]) -> URL? {
+    let best = mountEntries
+        .filter { $0.host.lowercased() == components.host.lowercased() }
+        .filter { hasPrefix(components.pathComponents, prefix: $0.remotePathComponents) }
+        .sorted { $0.remotePathComponents.count > $1.remotePathComponents.count }
+        .first
+
+    guard let best else { return nil }
+
+    var resolved = best.mountPoint
+    for p in components.pathComponents.dropFirst(best.remotePathComponents.count) {
+        resolved.appendPathComponent(p, isDirectory: true)
+    }
+    return resolved
+}
+
+func resolveSMBMountedPath(from smbURLString: String) throws -> URL {
+    let components = try parseSMBURL(smbURLString)
+    if let resolved = mountedPath(for: components, mountEntries: currentSMBMountEntries()) {
+        return resolved
+    }
+
+    var mountBase = URL(fileURLWithPath: "/Volumes").appendingPathComponent(components.shareName, isDirectory: true)
     if FileManager.default.fileExists(atPath: mountBase.path) {
-        if !isMountPoint(mountBase), let mounted = findMountedShareDirectory(caseInsensitive: share) {
+        if !isMountPoint(mountBase), let mounted = findMountedShareDirectory(caseInsensitive: components.shareName) {
             mountBase = mounted
         }
-    } else if let mounted = findMountedShareDirectory(caseInsensitive: share) {
+    } else if let mounted = findMountedShareDirectory(caseInsensitive: components.shareName) {
         mountBase = mounted
     }
     if !FileManager.default.fileExists(atPath: mountBase.path) || !isMountPoint(mountBase) {
         throw CopyError.smbNotMounted(expectedMountPoint: mountBase.path)
     }
     var dest = mountBase
-    for p in remainder { dest.appendPathComponent(p, isDirectory: true) }
+    for p in components.remainder { dest.appendPathComponent(p, isDirectory: true) }
     return dest
 }
 
@@ -246,7 +375,8 @@ func resumableCopy(
     force: Bool,
     verify: Bool,
     quiet: Bool,
-    progressIntervalSeconds: Double = 1.0
+    progressIntervalSeconds: Double = 1.0,
+    isCancelled: (() -> Bool)? = nil
 ) throws -> URL {
     let srcPath = src.path
     guard FileManager.default.fileExists(atPath: srcPath) else {
@@ -328,9 +458,19 @@ func resumableCopy(
     try dstHandle.seekToEnd()
 
     while true {
+        if isCancelled?() == true {
+            dstHandle.synchronizeFile()
+            throw CopyError.cancelled
+        }
+
         guard let chunk = try srcHandle.read(upToCount: max(1, chunkBytes)), !chunk.isEmpty else { break }
         try dstHandle.write(contentsOf: chunk)
         bytesCopied += UInt64(chunk.count)
+
+        if isCancelled?() == true {
+            dstHandle.synchronizeFile()
+            throw CopyError.cancelled
+        }
 
         if !quiet {
             let now = CFAbsoluteTimeGetCurrent()
@@ -380,6 +520,14 @@ func resumableCopy(
 }
 
 do {
+    let cancellationState = SignalCancellationState()
+    cancellationState.install()
+
+    if CommandLine.arguments.contains("--version") {
+        print(htkisFCNASCopyVersion)
+        exit(0)
+    }
+
     let a = try parseArgs(Array(CommandLine.arguments.dropFirst()))
     let src = URL(fileURLWithPath: a.src).standardizedFileURL
 
@@ -401,7 +549,8 @@ do {
         overwrite: a.overwrite,
         force: a.force,
         verify: a.verify,
-        quiet: a.quiet
+        quiet: a.quiet,
+        isCancelled: cancellationState.isCancelled
     )
     if !a.quiet { print("Done: \(out.path)") }
     exit(0)
@@ -409,6 +558,10 @@ do {
     if case .usage = e {
         printUsage()
         exit(2)
+    }
+    if case .cancelled = e {
+        fputs("Error: \(e.localizedDescription)\n", stderr)
+        exit(130)
     }
     fputs("Error: \(e.localizedDescription)\n", stderr)
     exit(2)

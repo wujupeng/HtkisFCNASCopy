@@ -1,5 +1,30 @@
+import Dispatch
 import Foundation
 import ResumeSMBCopyCore
+
+let htkisFCNASCopyVersion = "1.0.5"
+
+final class SignalCancellationState {
+    private let queue = DispatchQueue(label: "HtkisFCNASCopy.SignalCancellation")
+    private var cancelled = false
+    private var sources: [DispatchSourceSignal] = []
+
+    func install() {
+        for sig in [SIGINT, SIGTERM] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+            source.setEventHandler { [weak self] in
+                self?.cancelled = true
+            }
+            source.resume()
+            sources.append(source)
+        }
+    }
+
+    func isCancelled() -> Bool {
+        queue.sync { cancelled }
+    }
+}
 
 struct Args {
     var src: String
@@ -28,6 +53,7 @@ func printUsage() {
       --verify            Verify sha256 after transfer (slower)
       --quiet             Reduce output
       --mount-timeout N   Wait up to N seconds for Finder mount (default: 60)
+      --version           Print version
     """
     print(s)
 }
@@ -82,6 +108,10 @@ func readableBytes(_ n: Double) -> String {
 
 func main() -> Int32 {
     let argv = Array(CommandLine.arguments.dropFirst())
+    if argv.contains("--version") {
+        print(htkisFCNASCopyVersion)
+        return 0
+    }
     guard let a = parseArgs(argv) else {
         printUsage()
         return 2
@@ -110,7 +140,8 @@ func main() -> Int32 {
         overwrite: a.overwrite,
         force: a.force,
         verify: a.verify,
-        quiet: a.quiet
+        quiet: a.quiet,
+        isCancelled: cancellationState.isCancelled
     )
 
     do {
@@ -131,6 +162,10 @@ func main() -> Int32 {
         }
         return 0
     } catch let e as CopyError {
+        if e == .cancelled {
+            fputs("Error: \(e.localizedDescription)\n", stderr)
+            return 130
+        }
         fputs("Error: \(e.localizedDescription)\n", stderr)
         return 2
     } catch {
@@ -139,4 +174,6 @@ func main() -> Int32 {
     }
 }
 
+let cancellationState = SignalCancellationState()
+cancellationState.install()
 exit(main())

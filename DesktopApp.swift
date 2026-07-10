@@ -121,6 +121,11 @@ class TransferBaseModel: ObservableObject {
                     if self.statusText.isEmpty || self.statusText == runningText {
                         self.statusText = "完成"
                     }
+                } else if proc.terminationStatus == 130 {
+                    if self.statusText.isEmpty || self.statusText == runningText || self.statusText.hasPrefix("失败") {
+                        self.statusText = "已停止（可再次点击开始继续）"
+                    }
+                    self.lastErrorText = ""
                 } else {
                     if self.statusText.isEmpty || self.statusText == runningText {
                         self.statusText = "失败（退出码 \(proc.terminationStatus)）"
@@ -173,6 +178,17 @@ class TransferBaseModel: ObservableObject {
         if let (fraction, formatted) = parseProgressLine(trimmed) {
             progressFraction = fraction
             progressText = formatted
+            appendLog(trimmed + "\n")
+            return
+        }
+        if trimmed.hasPrefix("Scanning") {
+            statusText = trimmed
+            lastErrorText = ""
+            appendLog(trimmed + "\n")
+            return
+        }
+        if trimmed == "Error: Transfer cancelled. Run again to resume." {
+            statusText = "已停止（可再次点击开始继续）"
             appendLog(trimmed + "\n")
             return
         }
